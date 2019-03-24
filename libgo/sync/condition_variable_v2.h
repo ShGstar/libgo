@@ -14,6 +14,8 @@ class condition_variable_v2
         Processer::SuspendEntry entry;
         
         LFLock notified;
+
+        std::unique_ptr<std::timed_mutex> thread_entry;
     };
 
     TSQueue<Entry> queue_;
@@ -23,12 +25,45 @@ public:
     std::cv_status wait(LockType & lock)
     {
         Entry* entry = new Entry;
-        entry->entry = Processer::Suspend();
-        queue_.push(entry);
-        lock.unlock();
-        Processer::StaticCoYield();
-//        lock.lock();
+
+        if (Processer::IsCoroutine()) {
+            entry->entry = Processer::Suspend();
+            queue_.push(entry);
+            lock.unlock();
+            Processer::StaticCoYield();
+        } else {
+            entry->thread_entry.reset(new std::timed_mutex);
+            entry->thread_entry->lock();
+            queue_.push(entry);
+            lock.unlock();
+            entry->thread_entry->lock();
+        }
+
+        lock.lock();
         return std::cv_status::no_timeout;
+    }
+
+    template <typename LockType, typename TimePointType>
+    std::cv_status wait_util(LockType & lock, TimePointType timepoint)
+    {
+        Entry* entry = new Entry;
+
+        if (Processer::IsCoroutine()) {
+            entry->entry = Processer::Suspend(timepoint);
+            queue_.push(entry);
+            lock.unlock();
+            Processer::StaticCoYield();
+        } else {
+            entry->thread_entry = new std::timed_mutex;
+            entry->thread_entry->lock();
+            queue_.push(entry);
+            lock.unlock();
+            entry->thread_entry->try_lock_until(timepoint);
+        }
+
+        lock.lock();
+        return entry->notified.try_lock() ?
+            std::cv_status::timeout : std::cv_status::no_timeout;
     }
 
     bool notify_one()
@@ -41,7 +76,10 @@ public:
             if (!entry->notified.try_lock())
                 continue;
 
-            if (Processer::Wakeup(entry->entry))
+            if (entry->thread_entry) {
+                entry->thread_entry->unlock();
+                return true;
+            } else if (Processer::Wakeup(entry->entry))
                 return true;
         }
 
